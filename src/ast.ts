@@ -20,6 +20,7 @@
 
 import { createRequire } from "node:module";
 import { extname } from "node:path";
+import { withLock } from "lifecycle-utils";
 import type { BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
@@ -178,7 +179,6 @@ const SCORE_MAP: Record<string, number> = {
 let ParserClass: typeof import("web-tree-sitter").Parser | null = null;
 let LanguageClass: typeof import("web-tree-sitter").Language | null = null;
 let QueryClass: typeof import("web-tree-sitter").Query | null = null;
-let initPromise: Promise<void> | null = null;
 
 /** Languages that have already failed to load — warn only once per process. */
 const failedLanguages = new Set<string>();
@@ -196,16 +196,21 @@ const queryCache = new Map<string, QueryType>();
  * Initialize web-tree-sitter. Called once and cached.
  */
 async function ensureInit(): Promise<void> {
-  if (!initPromise) {
-    initPromise = (async () => {
-      const mod = await import("web-tree-sitter");
-      ParserClass = mod.Parser;
-      LanguageClass = mod.Language;
-      QueryClass = mod.Query;
-      await ParserClass.init();
-    })();
+  if (ParserClass && LanguageClass && QueryClass) {
+    return;
   }
-  return initPromise;
+
+  await withLock([ensureInit, "init"], async () => {
+    if (ParserClass && LanguageClass && QueryClass) {
+      return;
+    }
+
+    const mod = await import("web-tree-sitter");
+    await mod.Parser.init();
+    ParserClass = mod.Parser;
+    LanguageClass = mod.Language;
+    QueryClass = mod.Query;
+  });
 }
 
 /**

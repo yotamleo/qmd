@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
+import { LlamaCpp } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
   test("exits 0 after successful output when post-output LLM cleanup fails", async () => {
@@ -66,33 +66,6 @@ describe("CLI successful-exit lifecycle", () => {
       expect(process.exitCode).toBe(0);
     } finally {
       process.exitCode = prevCode;
-    }
-  });
-
-  test("darwin Metal mitigation reflects launcher-exported env on darwin", () => {
-    // The real mitigation lives in bin/qmd, which sets GGML_METAL_NO_RESIDENCY=1
-    // before Node loads the llama.cpp native binding. The JS-side predicate
-    // just reports whether that env was set (and not overridden by
-    // QMD_METAL_KEEP_RESIDENCY). On non-darwin the function returns false.
-    const expected =
-      process.platform === "darwin" &&
-      process.env.QMD_METAL_KEEP_RESIDENCY !== "1" &&
-      process.env.GGML_METAL_NO_RESIDENCY === "1";
-    expect(isDarwinMetalMitigationActive()).toBe(expected);
-  });
-
-  test("QMD_METAL_KEEP_RESIDENCY=1 disables the mitigation even when GGML_METAL_NO_RESIDENCY is set", () => {
-    const prevKeep = process.env.QMD_METAL_KEEP_RESIDENCY;
-    const prevNoRes = process.env.GGML_METAL_NO_RESIDENCY;
-    try {
-      process.env.QMD_METAL_KEEP_RESIDENCY = "1";
-      process.env.GGML_METAL_NO_RESIDENCY = "1";
-      expect(isDarwinMetalMitigationActive()).toBe(false);
-    } finally {
-      if (prevKeep === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
-      else process.env.QMD_METAL_KEEP_RESIDENCY = prevKeep;
-      if (prevNoRes === undefined) delete process.env.GGML_METAL_NO_RESIDENCY;
-      else process.env.GGML_METAL_NO_RESIDENCY = prevNoRes;
     }
   });
 

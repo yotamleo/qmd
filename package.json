@@ -59,7 +59,8 @@
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "12.10.0",
     "fast-glob": "3.3.3",
-    "node-llama-cpp": "3.18.1",
+    "lifecycle-utils": "^3.1.1",
+    "node-llama-cpp": "^3.19.0",
     "picomatch": "4.0.4",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
@@ -94,6 +95,10 @@
       "tree-sitter-typescript"
     ]
   },
+  "config": {
+    "nodeLlamaCppPostinstall": "ignoreFailedBuild"
+  },
+  "packageManager": "pnpm@10.32.1",
   "peerDependencies": {
     "typescript": "^5.9.3"
   },

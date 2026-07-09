@@ -4,40 +4,21 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import type {
-  Llama,
-  LlamaModel,
-  LlamaEmbeddingContext,
-  Token as LlamaToken,
+import {
+  type Llama,
+  type LlamaModel,
+  type LlamaEmbeddingContext,
+  type Token as LlamaToken,
+  getLlama,
+  getLlamaGpuTypes,
+  resolveModelFile,
+  LlamaChatSession,
+  LlamaLogLevel
 } from "node-llama-cpp";
+import { withLock } from "lifecycle-utils";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
-
-type NodeLlamaCppModule = {
-  getLlama: (options: Record<string, unknown>) => Promise<Llama>;
-  getLlamaGpuTypes?: (include?: "supported" | "allValid") => Promise<LlamaGpuMode[]>;
-  resolveModelFile: (model: string, cacheDir: string) => Promise<string>;
-  LlamaChatSession: new (options: { contextSequence: unknown }) => {
-    prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
-  };
-  LlamaLogLevel: { error: unknown };
-};
-
-let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
-async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
-  nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
-    () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
-  );
-  return nodeLlamaCppImport;
-}
-
-export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
-  nodeLlamaCppImport = module ? Promise.resolve(module) : null;
-  failedGpuInitModes.clear();
-  noGpuAccelerationWarningShown = false;
-  cpuForcedPrebuiltFallbackWarningShown = false;
-}
 
 type StdoutWrite = typeof process.stdout.write;
 let nativeStdoutRedirectDepth = 0;
@@ -495,7 +476,6 @@ export async function pullModels(
       }
     }
 
-    const { resolveModelFile } = await loadNodeLlamaCpp();
     const path = await resolveModelFile(model, cacheDir);
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
@@ -692,6 +672,7 @@ function isCpuModeRequested(): boolean {
 
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
+  private readonly lockScope = {};
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
@@ -705,16 +686,6 @@ export class LlamaCpp implements LLM {
   private modelCacheDir: string;
   private expandContextSize: number;
 
-  // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
-  private embedModelLoadPromise: Promise<LlamaModel> | null = null;
-  private generateModelLoadPromise: Promise<LlamaModel> | null = null;
-  private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
-  // Guard against concurrent ensureLlama() calls creating duplicate Llama
-  // instances. Without this, two concurrent callers each build their own
-  // runtime and the last write to this.llama wins, leaving models/grammars
-  // bound to different Llama instances ("different Llama instance" errors).
-  private llamaLoadPromise: Promise<Llama> | null = null;
-
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private inactivityTimeoutMs: number;
@@ -725,12 +696,6 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
-    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
-    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
-    // See isDarwinMetalMitigationActive() for the runtime check exposed to
-    // diagnostics. No constructor-time guard installation is needed.
-
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -832,10 +797,6 @@ export class LlamaCpp implements LLM {
         await this.rerankModel.dispose();
         this.rerankModel = null;
       }
-      // Reset load promises so models can be reloaded later
-      this.embedModelLoadPromise = null;
-      this.generateModelLoadPromise = null;
-      this.rerankModelLoadPromise = null;
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -857,22 +818,18 @@ export class LlamaCpp implements LLM {
     if (this.llama) {
       return this.llama;
     }
-    if (this.llamaLoadPromise) {
-      return await this.llamaLoadPromise;
-    }
-    this.llamaLoadPromise = this.loadLlamaRuntime(allowBuild);
-    try {
-      return await this.llamaLoadPromise;
-    } finally {
-      this.llamaLoadPromise = null;
-    }
+    return await withLock([this.lockScope, "llama"] as const, async () => {
+      if (this.llama) {
+        return this.llama;
+      }
+      return await this.loadLlamaRuntime(allowBuild);
+    });
   }
 
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
-      const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
       const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
@@ -921,9 +878,8 @@ export class LlamaCpp implements LLM {
           // documented auto mode for Metal/CUDA/Vulkan while recovering on
           // systems where a packaged backend can load but detection is too
           // conservative. Never compile during these extra probes.
-          if (gpuMode === "auto" && llama.gpu === false && getLlamaGpuTypes) {
-            const candidates = (await getLlamaGpuTypes("allValid"))
-              .filter((candidate): candidate is Exclude<LlamaGpuMode, "auto" | false> => candidate !== false && candidate !== "auto");
+          if (gpuMode === "auto" && llama.gpu === false) {
+            const candidates = (await getLlamaGpuTypes("allValid")).filter((candidate) => candidate !== false);
             for (const candidate of candidates) {
               if (failedGpuInitModes.has(candidate)) continue;
               try {
@@ -981,7 +937,6 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
     return modelPath;
@@ -994,11 +949,12 @@ export class LlamaCpp implements LLM {
     if (this.embedModel) {
       return this.embedModel;
     }
-    if (this.embedModelLoadPromise) {
-      return await this.embedModelLoadPromise;
-    }
 
-    this.embedModelLoadPromise = (async () => {
+    return await withLock([this.lockScope, "embedModel"] as const, async () => {
+      if (this.embedModel) {
+        return this.embedModel;
+      }
+
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.embedModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
@@ -1006,14 +962,7 @@ export class LlamaCpp implements LLM {
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
-    })();
-
-    try {
-      return await this.embedModelLoadPromise;
-    } finally {
-      // Keep the resolved model cached; clear only the in-flight promise.
-      this.embedModelLoadPromise = null;
-    }
+    });
   }
 
   /**
@@ -1057,23 +1006,18 @@ export class LlamaCpp implements LLM {
     return Math.max(1, Math.floor(cores / parallelism));
   }
 
-  /**
-   * Load embedding contexts (lazy). Creates multiple for parallel embedding.
-   * Uses promise guard to prevent concurrent context creation race condition.
-   */
-  private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
-
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
     if (this.embedContexts.length > 0) {
       this.touchActivity();
       return this.embedContexts;
     }
 
-    if (this.embedContextsCreatePromise) {
-      return await this.embedContextsCreatePromise;
-    }
+    return await withLock([this.lockScope, "embedContexts"] as const, async () => {
+      if (this.embedContexts.length > 0) {
+        this.touchActivity();
+        return this.embedContexts;
+      }
 
-    this.embedContextsCreatePromise = (async () => {
       const model = await this.ensureEmbedModel();
       // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
       const n = await this.computeParallelism(150);
@@ -1091,13 +1035,7 @@ export class LlamaCpp implements LLM {
       }
       this.touchActivity();
       return this.embedContexts;
-    })();
-
-    try {
-      return await this.embedContextsCreatePromise;
-    } finally {
-      this.embedContextsCreatePromise = null;
-    }
+    });
   }
 
   /**
@@ -1112,30 +1050,25 @@ export class LlamaCpp implements LLM {
    * Load generation model (lazy) - context is created fresh per call
    */
   private async ensureGenerateModel(): Promise<LlamaModel> {
-    if (!this.generateModel) {
-      if (this.generateModelLoadPromise) {
-        return await this.generateModelLoadPromise;
+    if (this.generateModel) {
+      this.touchActivity();
+      return this.generateModel;
+    }
+
+    const model = await withLock([this.lockScope, "generateModel"] as const, async () => {
+      if (this.generateModel) {
+        return this.generateModel;
       }
 
-      this.generateModelLoadPromise = (async () => {
         const llama = await this.ensureLlama();
         const modelPath = await this.resolveModel(this.generateModelUri);
         const model = await llama.loadModel(this.modelLoadOptions(modelPath));
         this.generateModel = model;
         return model;
-      })();
+    });
 
-      try {
-        await this.generateModelLoadPromise;
-      } finally {
-        this.generateModelLoadPromise = null;
-      }
-    }
     this.touchActivity();
-    if (!this.generateModel) {
-      throw new Error("Generate model not loaded");
-    }
-    return this.generateModel;
+    return model;
   }
 
   /**
@@ -1145,11 +1078,12 @@ export class LlamaCpp implements LLM {
     if (this.rerankModel) {
       return this.rerankModel;
     }
-    if (this.rerankModelLoadPromise) {
-      return await this.rerankModelLoadPromise;
-    }
 
-    this.rerankModelLoadPromise = (async () => {
+    return await withLock([this.lockScope, "rerankModel"] as const, async () => {
+      if (this.rerankModel) {
+        return this.rerankModel;
+      }
+
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
@@ -1157,13 +1091,7 @@ export class LlamaCpp implements LLM {
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
-    })();
-
-    try {
-      return await this.rerankModelLoadPromise;
-    } finally {
-      this.rerankModelLoadPromise = null;
-    }
+    });
   }
 
   /**
@@ -1192,7 +1120,17 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity();
+      return this.rerankContexts;
+    }
+
+    return await withLock([this.lockScope, "rerankContexts"] as const, async () => {
+      if (this.rerankContexts.length > 0) {
+        this.touchActivity();
+        return this.rerankContexts;
+      }
+
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
       const n = Math.min(await this.computeParallelism(1000), 4);
@@ -1218,9 +1156,9 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
-    }
-    this.touchActivity();
-    return this.rerankContexts;
+      this.touchActivity();
+      return this.rerankContexts;
+    });
   }
 
   // ==========================================================================
@@ -1401,7 +1339,6 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -1486,7 +1423,6 @@ export class LlamaCpp implements LLM {
         contextSize: this.expandContextSize,
       });
       const sequence = genContext.getSequence();
-      const { LlamaChatSession } = await loadNodeLlamaCpp();
       const session = new LlamaChatSession({ contextSequence: sequence });
 
       // Qwen3 recommended settings for non-thinking mode:
@@ -1690,9 +1626,7 @@ export class LlamaCpp implements LLM {
     }
 
     // Explicitly dispose in dependency order: contexts first, then models, then llama.
-    // Relying only on llama.dispose() leaves Metal resource sets alive until process
-    // finalization on Apple Silicon, where ggml_metal_device_free can abort after
-    // otherwise-successful CLI output (#368).
+    // This avoids relying solely on runtime finalizers during CLI shutdown.
     for (const ctx of this.embedContexts) {
       await disposeWithTimeout("embedding context", () => ctx.dispose());
     }
@@ -1721,12 +1655,6 @@ export class LlamaCpp implements LLM {
       this.llama = null;
     }
 
-    // Clear any in-flight load/create promises
-    this.embedModelLoadPromise = null;
-    this.embedContextsCreatePromise = null;
-    this.generateModelLoadPromise = null;
-    this.rerankModelLoadPromise = null;
-    this.llamaLoadPromise = null;
   }
 }
 
@@ -1976,66 +1904,6 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Darwin Metal exit-crash mitigation
-// =============================================================================
-//
-// libggml-metal on macOS keeps allocated model memory wired via "residency
-// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
-// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
-// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
-// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
-// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
-// stderr after the user-visible output. See ggml-org/llama.cpp#22593.
-//
-// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
-// prevent it: the static destructor runs after every JS-reachable cleanup,
-// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
-// does NOT skip C++ static destructors — verified in
-// node/src/api/environment.cc).
-//
-// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
-// which we set from `bin/qmd` before Node loads the native binding. For QMD's
-// short-lived CLI workflow this has no measurable cost (subsequent calls
-// don't reuse the warm mapping). The functions below report whether that
-// mitigation is in effect — kept here, in the module that depends on the
-// underlying resource, so doctor can answer "is the protection active?"
-// without reaching into env handling directly.
-//
-// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
-// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
-// env var is accepted as a no-op alias for back-compat; it had no effect on
-// Node prior to this fix.
-
-/**
- * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
- *   true  → residency sets disabled, process exit completes silently
- *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
- *           in which case the libggml-metal teardown assertion may fire
- */
-export function isDarwinMetalMitigationActive(): boolean {
-  if (process.platform !== "darwin") return false;
-  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
-  return process.env.GGML_METAL_NO_RESIDENCY === "1";
-}
-
-/**
- * Compatibility shim: previous releases installed a `process.on('exit')` hook
- * that tried to skip the C++ static destructor by calling `process.reallyExit`.
- * That mechanism didn't work on Node (Environment::Exit still calls libc
- * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
- * Kept as a no-op for code paths that still call it; safe to remove once no
- * production launcher predates the residency-set fix.
- */
-export function installDarwinExitGuard(): void {
-  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
-}
-
-/** @deprecated Replaced by isDarwinMetalMitigationActive. */
-export function isDarwinExitGuardInstalled(): boolean {
-  return isDarwinMetalMitigationActive();
-}
-
-// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
@@ -2043,8 +1911,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * instance lazy-loads the node-llama-cpp runtime and models on first use.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
@@ -2054,13 +1921,9 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
- * non-null instance also ensures the darwin exit guard is installed — keeps
- * the invariant intact for test doubles that didn't go through the real
- * constructor.
+ * Set a custom default LlamaCpp instance (useful for testing).
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 

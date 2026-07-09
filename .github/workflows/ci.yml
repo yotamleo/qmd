@@ -23,6 +23,8 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      - uses: pnpm/action-setup@v6
+
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -31,7 +33,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sqlite
 
-      - run: npm install
+      - run: pnpm install --frozen-lockfile
 
       - name: Tests
         run: npx vitest run --reporter=verbose --testTimeout 60000 test/

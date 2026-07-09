@@ -2916,10 +2916,6 @@ function parseCLI() {
       watch: { type: "boolean" },
       interval: { type: "string" },  // e.g. "30s", "5m", "1h"
       embed: { type: "boolean" },    // auto-embed after each update tick
-      // Watch options (update --watch)
-      watch: { type: "boolean" },
-      interval: { type: "string" },  // e.g. "30s", "5m", "1h"
-      embed: { type: "boolean" },    // auto-embed after each update tick
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line

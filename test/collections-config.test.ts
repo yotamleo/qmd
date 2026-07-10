@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
+import { getConfigPath, loadConfig, normalizeIndexName, setConfigIndexName } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -94,5 +94,17 @@ describe("getConfigDir via getConfigPath", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("normalizes Windows absolute paths into safe index names", () => {
+    expect(normalizeIndexName("C:\\Users\\axulo\\Documents\\ppttest")).toBe(
+      "C_Users_axulo_Documents_ppttest"
+    );
+  });
+
+  test("uses a normalized filename when QMD_CONFIG_DIR is set and index name is a Windows path", () => {
+    process.env.QMD_CONFIG_DIR = "/custom/qmd-config";
+    setConfigIndexName("C:\\Users\\axulo\\Documents\\ppttest");
+    expect(getConfigPath()).toBe(join("/custom/qmd-config", "C_Users_axulo_Documents_ppttest.yml"));
   });
 });

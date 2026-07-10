@@ -101,6 +101,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  normalizeIndexName,
   loadConfig,
   saveConfig,
   setConfigSource,
@@ -182,13 +183,7 @@ function getActiveIndexName(): string {
 }
 
 function setIndexName(name: string | null): void {
-  let normalizedName = name;
-  // Normalize relative paths to prevent malformed database paths
-  if (name && name.includes('/')) {
-    const absolutePath = pathResolve(process.cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
-  }
+  const normalizedName = name ? normalizeIndexName(name) : name;
   currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index

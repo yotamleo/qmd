@@ -752,6 +752,13 @@ async function updateCollections(updateOpts: UpdateOptions = {}): Promise<Update
 
   // Filter by collection names if specified
   if (collectionFilter && collectionFilter.length > 0) {
+    for (const name of collectionFilter) {
+      if (!getCollectionFromYaml(name)) {
+        console.error(`Collection '${name}' not found.`);
+        if (!updateOpts.keepDbOpen) closeDb();
+        process.exit(1);
+      }
+    }
     collections = collections.filter(col => collectionFilter.includes(col.name));
     if (collections.length === 0) {
       logInfo(`${c.dim}No matching collections found. Available: ${listCollections(db).map(col => col.name).join(', ')}${c.reset}`);
@@ -878,7 +885,8 @@ async function updateCollections(updateOpts: UpdateOptions = {}): Promise<Update
   summary.needsEmbedding = needsEmbedding;
   if (!updateOpts.keepDbOpen) closeDb();
 
-  logInfo(`${c.green}✓ All collections updated.${c.reset}`);
+  const updatedLabel = collections.length === 1 ? `'${collections[0]!.name}'` : `${collections.length} collections`;
+  logInfo(`${c.green}✓ ${updatedLabel} updated.${c.reset}`);
   if (needsEmbedding > 0) {
     logInfo(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }

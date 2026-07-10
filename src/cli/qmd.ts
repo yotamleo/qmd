@@ -2944,6 +2944,7 @@ function parseCLI() {
       // Daemon client opt-out for search commands
       "no-daemon": { type: "boolean", default: false },
       "keep-models": { type: "boolean" },
+      warm: { type: "boolean" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3510,6 +3511,8 @@ function showHelp(): void {
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("  - Use `qmd mcp --keep-models` (or QMD_KEEP_MODELS=1) to keep model weights warm between queries.");
   console.log("    This avoids reload latency for long-running servers. For one-off CLI use the default is fine.");
+  console.log("  - `qmd mcp --http --warm` pre-loads the embedding model for fast vector searches (~24ms vs ~700ms cold).");
+  console.log("  - REST endpoints: POST /search/bm25, /search/vector, /search/hybrid, /query");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
@@ -4652,9 +4655,10 @@ if (isMain) {
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
           const keepModelsArgs = keepModels ? ["--keep-models"] : [];
+          const warmArgs = cli.values.warm ? ["--warm"] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...keepModelsArgs]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...keepModelsArgs];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...keepModelsArgs, ...warmArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs, ...keepModelsArgs, ...warmArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4674,7 +4678,7 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host, keepModels });
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host, keepModels, warm: !!cli.values.warm });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);

@@ -656,7 +656,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string; warm?: boolean } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -684,6 +684,17 @@ export async function startMcpHttpServer(
 
   function log(msg: string): void {
     if (!quiet) console.error(msg);
+  }
+
+  // Optionally warm the embedding model so first vector search is fast (~24ms vs ~700ms cold)
+  if (options?.warm) {
+    const warmStart = Date.now();
+    try {
+      await store.searchVector("warmup", { limit: 1 });
+    } catch { /* embedding may not be available — that's fine */ }
+    if (!quiet) {
+      console.error(`Embedding model warmed in ${Date.now() - warmStart}ms`);
+    }
   }
 
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
@@ -970,6 +981,68 @@ export async function startMcpHttpServer(
           nodeRes.end(JSON.stringify({ error: message }));
         }
         return;
+      }
+
+      // REST endpoint: POST /search/bm25 — BM25 keyword search (no LLM)
+      // REST endpoint: POST /search/vector — vector similarity search (embedding model only)
+      // REST endpoint: POST /search/hybrid — BM25 + vector RRF fusion (no LLM reranking)
+      if (pathname?.startsWith("/search/") && nodeReq.method === "POST") {
+        const mode = pathname.slice("/search/".length);
+        if (mode !== "bm25" && mode !== "vector" && mode !== "hybrid") {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: `Unknown search mode: ${mode}. Use bm25, vector, or hybrid.` }));
+          return;
+        }
+
+        const rawBody = await collectBody(nodeReq);
+        const params = JSON.parse(rawBody);
+
+        if (!params.query || typeof params.query !== "string") {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required field: query (string)" }));
+          return;
+        }
+
+        const limit = params.limit ?? 10;
+        const collection = params.collection;
+
+        if (mode === "bm25") {
+          const results = await store.searchLex(params.query, { limit, collection });
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results, mode, latency_ms: Date.now() - reqStart }));
+          log(`${ts()} POST /search/bm25 "${params.query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+          return;
+        }
+
+        if (mode === "vector") {
+          const results = await store.searchVector(params.query, { limit, collection });
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results, mode, latency_ms: Date.now() - reqStart }));
+          log(`${ts()} POST /search/vector "${params.query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+          return;
+        }
+
+        if (mode === "hybrid") {
+          const results = await store.search({
+            query: params.query,
+            collection,
+            limit,
+            minScore: params.minScore ?? 0,
+            intent: params.intent,
+            rerank: false,
+          });
+          const formatted = results.map(r => ({
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: r.context,
+          }));
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results: formatted, mode, latency_ms: Date.now() - reqStart }));
+          log(`${ts()} POST /search/hybrid "${params.query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+          return;
+        }
       }
 
       if (pathname === "/mcp" && nodeReq.method === "POST") {

@@ -702,6 +702,10 @@ interface UpdateOptions {
   quiet?: boolean;
   /** Skip closeDb() at end (caller owns DB lifecycle, e.g. watch loop). */
   keepDbOpen?: boolean;
+  /** Update only these collection names. Mutually exclusive with excludeFilter. */
+  collectionFilter?: string[];
+  /** Update all collections EXCEPT these names. Mutually exclusive with collectionFilter. */
+  excludeFilter?: string[];
 }
 
 interface UpdateSummary {
@@ -724,10 +728,19 @@ async function updateCollections(updateOpts: UpdateOptions = {}): Promise<Update
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
+  const { collectionFilter, excludeFilter } = updateOpts;
+
+  // Validate mutual exclusivity of -c and --exclude
+  if (collectionFilter && collectionFilter.length > 0 && excludeFilter && excludeFilter.length > 0) {
+    console.error(`${c.yellow}Error: -c/--collection and --exclude are mutually exclusive.${c.reset}`);
+    if (!updateOpts.keepDbOpen) closeDb();
+    process.exit(1);
+  }
+
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
 
   const summary: UpdateSummary = {
     indexed: 0,
@@ -736,6 +749,28 @@ async function updateCollections(updateOpts: UpdateOptions = {}): Promise<Update
     anyChange: false,
     needsEmbedding: 0,
   };
+
+  // Filter by collection names if specified
+  if (collectionFilter && collectionFilter.length > 0) {
+    collections = collections.filter(col => collectionFilter.includes(col.name));
+    if (collections.length === 0) {
+      logInfo(`${c.dim}No matching collections found. Available: ${listCollections(db).map(col => col.name).join(', ')}${c.reset}`);
+      if (!updateOpts.keepDbOpen) closeDb();
+      return summary;
+    }
+  }
+
+  // Exclude collections by name if specified
+  if (excludeFilter && excludeFilter.length > 0) {
+    const before = collections.length;
+    collections = collections.filter(col => !excludeFilter.includes(col.name));
+    if (collections.length === 0) {
+      logInfo(`${c.dim}All collections were excluded. Available: ${listCollections(db).map(col => col.name).join(', ')}${c.reset}`);
+      if (!updateOpts.keepDbOpen) closeDb();
+      return summary;
+    }
+    logInfo(`${c.dim}Excluded ${before - collections.length} collection(s): ${excludeFilter.join(', ')}${c.reset}\n`);
+  }
 
   if (collections.length === 0) {
     logInfo(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -829,6 +864,12 @@ async function updateCollections(updateOpts: UpdateOptions = {}): Promise<Update
         console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
       }
       console.log("");
+    }
+    if (result.skippedFiles && result.skippedFiles.length > 0) {
+      console.log(`${c.yellow}Skipped ${result.skippedFiles.length} file(s) due to read errors:${c.reset}`);
+      for (const skipped of result.skippedFiles) {
+        console.log(`  ${c.dim}- ${skipped}${c.reset}`);
+      }
     }
   }
 
@@ -1798,6 +1839,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  const skippedFiles: string[] = [];
   const startTime = Date.now();
 
   for (const relativeFile of files) {
@@ -1809,8 +1851,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+    } catch (err: any) {
+      // Skip files that can't be read (e.g. iCloud evicted, ETIMEDOUT, ENOENT)
+      const code = err?.code || "UNKNOWN";
+      process.stderr.write(`\n  warning: Skipped ${relativeFile}: ${code}\n`);
+      skippedFiles.push(relativeFile);
       processed++;
       progress.set((processed / total) * 100);
       continue;
@@ -1884,6 +1929,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+  if (skippedFiles.length > 0) {
+    console.log(`${c.yellow}Skipped ${skippedFiles.length} file(s) due to read errors:${c.reset}`);
+    for (const skipped of skippedFiles) {
+      console.log(`  ${c.dim}- ${skipped}${c.reset}`);
+    }
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
@@ -2917,6 +2968,7 @@ function parseCLI() {
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      exclude: { type: "string", multiple: true },  // Exclude collection(s) from update
       refresh: { type: "boolean" },
       // Watch options (update --watch)
       watch: { type: "boolean" },
@@ -3462,6 +3514,8 @@ function showHelp(): void {
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("    --watch [--interval <dur>]  - Re-index periodically (default 5m). Use 30s, 5m, 1h.");
   console.log("    --watch --embed             - Also auto-embed after each tick if new hashes appear");
+  console.log("    -c, --collection <name>     - Update only named collection(s) (repeatable)");
+  console.log("    --exclude <name>            - Update all EXCEPT named collection(s) (repeatable)");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
@@ -4453,6 +4507,11 @@ if (isMain) {
       break;
 
     case "update": {
+      const updateCollectionFilter = cli.opts.collection
+        ? (Array.isArray(cli.opts.collection) ? cli.opts.collection : [cli.opts.collection])
+        : undefined;
+      const updateExcludeFilter = cli.values.exclude as string[] | undefined;
+
       if (cli.values.watch) {
         const intervalRaw = (cli.values.interval as string | undefined) ?? "5m";
         let intervalMs: number;
@@ -4474,7 +4533,7 @@ if (isMain) {
         const result = await runWatchLoop({
           intervalMs,
           tick: async () => {
-            const summary = await updateCollections({ quiet: true });
+            const summary = await updateCollections({ quiet: true, collectionFilter: updateCollectionFilter, excludeFilter: updateExcludeFilter });
             if (runEmbed && summary.needsEmbedding > 0) {
               console.log(
                 `[${new Date().toISOString()}] embedding ${summary.needsEmbedding} new hash(es)...`,
@@ -4486,7 +4545,7 @@ if (isMain) {
         process.exit(result.stoppedBy === "max-failures" ? 1 : 0);
       }
 
-      await updateCollections();
+      await updateCollections({ collectionFilter: updateCollectionFilter, excludeFilter: updateExcludeFilter });
       break;
     }
 

@@ -935,8 +935,14 @@ export async function startMcpHttpServer(
         try {
           let results;
           if (hasQuery) {
+            // Single collection → filter at the SQL level. Multiple collections →
+            // search across all and post-filter below (hybridQuery only accepts a
+            // single collection; this mirrors the CLI querySearch pattern).
+            const singleCollection = effectiveCollections && effectiveCollections.length === 1
+              ? effectiveCollections[0]
+              : undefined;
             results = await hybridQuery(store.internal, queryParam, {
-              collection: effectiveCollections ? effectiveCollections[0] : undefined,
+              collection: singleCollection,
               limit,
               minScore,
               candidateLimit,
@@ -945,6 +951,10 @@ export async function startMcpHttpServer(
               skipRerank,
               chunkStrategy,
             });
+            if (effectiveCollections && effectiveCollections.length > 1) {
+              const prefixes = effectiveCollections.map(n => `qmd://${n}/`);
+              results = results.filter(r => prefixes.some(p => r.file.startsWith(p)));
+            }
           } else {
             const queries: ExpandedQuery[] = structuredSearches.map((search): ExpandedQuery => {
               if (!search || typeof search !== "object" || Array.isArray(search)) {
@@ -995,7 +1005,14 @@ export async function startMcpHttpServer(
         }
 
         const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody);
+        let params: any;
+        try {
+          params = JSON.parse(rawBody);
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
 
         if (!params.query || typeof params.query !== "string") {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });

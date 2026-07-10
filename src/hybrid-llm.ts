@@ -73,7 +73,9 @@ export class HybridLLM implements LLM {
     try {
       return await this.remote.rerank(query, documents, options);
     } catch (error) {
-      console.error("Remote rerank failed; falling back to local rerank:", error);
+      if (process.env.QMD_DEBUG === "1") {
+        console.error("Remote rerank failed; falling back to local rerank:", error);
+      }
       return this.local.rerank(query, documents, options);
     }
   }
@@ -98,7 +100,9 @@ export class HybridLLM implements LLM {
       try {
         return await this.remote.expandQuery(query, options);
       } catch (error) {
-        console.error("Remote query expansion failed; falling back to local expansion:", error);
+        if (process.env.QMD_DEBUG === "1") {
+          console.error("Remote query expansion failed; falling back to local expansion:", error);
+        }
       }
     }
     return this.local.expandQuery(query, options);

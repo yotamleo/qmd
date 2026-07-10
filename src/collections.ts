@@ -96,9 +96,7 @@ export function normalizeIndexName(name: string): string {
 
   let absolutePath = name;
   if (!isWindowsAbsolute) {
-    const { resolve } = require("path");
-    const { cwd } = require("process");
-    absolutePath = resolve(cwd(), name);
+    absolutePath = resolve(process.cwd(), name);
   }
 
   return absolutePath.replace(/[:\\/]+/g, "_").replace(/^_+/, "");

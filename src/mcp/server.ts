@@ -255,6 +255,26 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
     ),
   });
 
+  // Workaround for Claude Code bug that incorrectly serialises arguments as strings 
+  // instead of objects (https://github.com/anthropics/claude-code/issues/18260) 
+  const searchesSchemaCCWorkaround = z.preprocess(
+    (val) => {
+      // If it's already an array, pass through
+      if (Array.isArray(val)) return val;
+      // If it's a stringified array, parse it
+      if (typeof val === "string") {
+        try {
+          const parsed = JSON.parse(val);
+          return Array.isArray(parsed) ? parsed : val;
+        } catch {
+          return val; // Let Zod validation handle the error
+        }
+      }
+      return val;
+    },
+    z.array(subSearchSchema).min(1).max(10)
+  );
+
   server.registerTool(
     "query",
     {
@@ -325,7 +345,7 @@ Intent-aware lex (C++ performance, not sports):
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
           "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
         ),
-        searches: z.array(subSearchSchema).max(10).optional().describe(
+        searches: searchesSchemaCCWorkaround.optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
           "control over retrieval strategy. Mutually exclusive with 'query'."
         ),

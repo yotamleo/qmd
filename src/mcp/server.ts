@@ -138,7 +138,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   if (status.collections.length > 0) {
     lines.push("");
     const names = status.collections.map(c => c.name).join(", ");
-    lines.push(`Collections (scope with \`collections\` parameter): ${names}`);
+    lines.push(`Collections (scope with \`collections\` parameter — array of names): ${names}`);
     lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
   }
 

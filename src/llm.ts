@@ -68,12 +68,23 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * Detect if a model URI refers to a remote API model (not a local GGUF model).
+ * Remote models handle their own prompt formatting, so no prefixes should be added.
+ */
+export function isRemoteModel(modelUri: string): boolean {
+  // Local models use hf: URIs or local file paths ending in .gguf
+  return !modelUri.startsWith("hf:") && !modelUri.endsWith(".gguf");
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * Remote models receive raw text (they handle their own formatting).
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -84,9 +95,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields (default).
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
+ * Remote models receive raw text (they handle their own formatting).
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isRemoteModel(uri)) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -193,7 +206,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -212,6 +225,14 @@ export type QueryType = 'lex' | 'vec' | 'hyde';
 export type Queryable = {
   type: QueryType;
   text: string;
+};
+
+export type LLMExpandQueryOptions = {
+  context?: string;
+  includeLexical?: boolean;
+  intent?: string;
+  /** Reports the model that actually produced the returned expansion. */
+  onModelUsed?: (model: string) => void;
 };
 
 /**
@@ -505,6 +526,49 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * The embedding model name/URI
+   */
+  readonly embedModelName: string;
+
+  /**
+   * The generation model name/URI (used by query expansion).
+   */
+  readonly generateModelName: string;
+
+  /**
+   * The query-expansion model name/URI. Defaults to generateModelName for
+   * local backends, but remote chat expansion can use an independent model.
+   */
+  readonly expandModelName?: string;
+
+  /**
+   * The reranking model name/URI.
+   */
+  readonly rerankModelName: string;
+
+  /**
+   * True when embedding requests are served by a remote backend and callers may
+   * want to avoid local tokenizer/model initialization for preprocessing.
+   */
+  readonly usesRemoteEmbedding?: boolean;
+
+  /**
+   * Tokenize text using the embedding model's tokenizer (used for chunking).
+   * For remote-only backends this may throw or be unavailable.
+   */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+
+  /**
+   * Detokenize tokens back to text using the embedding model's tokenizer.
+   */
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -518,7 +582,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -710,6 +774,10 @@ export class LlamaCpp implements LLM {
   }
 
   get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get expandModelName(): string {
     return this.generateModelUri;
   }
 
@@ -1396,8 +1464,9 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: LLMExpandQueryOptions = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    options.onModelUsed?.(this.expandModelName);
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1675,11 +1744,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1715,7 +1784,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1818,18 +1887,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts, options));
   }
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean }
+    options?: LLMExpandQueryOptions
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1837,19 +1906,19 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
-// Session manager for the default LlamaCpp instance
+// Session manager for the default LLM instance
 let defaultSessionManager: LLMSessionManager | null = null;
 
 /**
- * Get the session manager for the default LlamaCpp instance.
+ * Get the session manager for the default LLM instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1884,11 +1953,11 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Execute a function with a scoped LLM session using a specific LLM instance.
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -1912,44 +1981,58 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLLMInstance: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
+ * Get the default LLM instance (creates a LlamaCpp if none set). The LlamaCpp
  * instance lazy-loads the node-llama-cpp runtime and models on first use.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
-  if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+export function getDefaultLLM(): LLM {
+  if (!defaultLLMInstance) {
+    defaultLLMInstance = new LlamaCpp();
   }
-  return defaultLlamaCpp;
+  return defaultLLMInstance;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing).
+ * Set the default LLM instance
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  defaultLlamaCpp = llm;
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLLMInstance = llm;
+}
+
+/** @deprecated Use getDefaultLLM() */
+export function getDefaultLlamaCpp(): LLM {
+  return getDefaultLLM();
 }
 
 /**
- * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * Set a custom default LLM instance (useful for testing).
+ *
+ * @deprecated Use setDefaultLLM()
+ */
+export function setDefaultLlamaCpp(llm: LLM | null): void {
+  setDefaultLLM(llm);
+}
+
+/**
+ * Peek at the default LLM instance without instantiating one. Used by
  * doctor and lifecycle diagnostics.
  */
 export function hasDefaultLlamaCpp(): boolean {
-  return defaultLlamaCpp !== null;
+  return defaultLLMInstance !== null;
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
+ * Dispose the default LLM instance if it exists.
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
+  if (defaultLLMInstance) {
+    await defaultLLMInstance.dispose();
+    defaultLLMInstance = null;
   }
 }

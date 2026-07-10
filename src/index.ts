@@ -25,6 +25,7 @@ import {
   addLineNumbers,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
+  syncCollection,
   generateEmbeddings,
   listCollections as storeListCollections,
   syncConfigToDb,
@@ -61,6 +62,8 @@ import {
   type SearchHooks,
   type ReindexProgress,
   type ReindexResult,
+  type SyncProgress,
+  type SyncResult,
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
@@ -101,6 +104,8 @@ export type {
   SearchHooks,
   ReindexProgress,
   ReindexResult,
+  SyncProgress,
+  SyncResult,
   EmbedProgress,
   EmbedResult,
   Collection,
@@ -305,6 +310,11 @@ export interface QMDStore {
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
+
+  /** Incremental sync using mtime-first diffing (faster than full update) */
+  sync(collectionName: string, options?: {
+    onProgress?: (info: SyncProgress) => void;
+  }): Promise<SyncResult>;
 
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
@@ -543,6 +553,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         removed: totalRemoved,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
       };
+    },
+
+    sync: async (collectionName, syncOpts) => {
+      const col = getStoreCollection(db, collectionName);
+      if (!col) throw new Error(`Collection not found: ${collectionName}`);
+      return syncCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
+        ignorePatterns: col.ignore,
+        onProgress: syncOpts?.onProgress,
+      });
     },
 
     embed: async (embedOpts) => {

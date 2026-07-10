@@ -617,6 +617,7 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  keepModels?: boolean;
 };
 
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
@@ -629,6 +630,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
+    keepModels: options.keepModels,
     ...(existsSync(configPath) ? { configPath } : {}),
   });
   const server = await createMcpServer(store);
@@ -663,6 +665,7 @@ export async function startMcpHttpServer(
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
+    keepModels: options.keepModels,
     ...(existsSync(configPath) ? { configPath } : {}),
   });
 

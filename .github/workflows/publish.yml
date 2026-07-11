@@ -37,9 +37,14 @@ jobs:
           package-manager-cache: false
 
       - run: npm run build
-      - run: npm publish --provenance --access public
+
+      # Publish/release only from the upstream repo — forks have no npm
+      # credentials and must not attempt to publish under @tobilu.
+      - if: github.repository == 'tobi/qmd'
+        run: npm publish --provenance --access public
 
       - name: Extract release notes
+        if: github.repository == 'tobi/qmd'
         id: notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -48,6 +53,7 @@ jobs:
           echo "$NOTES" > /tmp/release-notes.md
 
       - name: Create GitHub release
+        if: github.repository == 'tobi/qmd'
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \

@@ -354,7 +354,17 @@ describe("syncCollection", () => {
     await unlink(join(dir, "orphan.md"));
     const result = await syncCollection(store, dir, "**/*.md", "test");
     expect(result.removed).toBe(1);
-    expect(result.orphanedCleaned).toBeGreaterThanOrEqual(1);
+    // Removed files are soft-deleted tombstones (active = 0), so their content
+    // stays referenced and is NOT orphaned yet.
+    expect(result.orphanedCleaned).toBe(0);
+
+    // Hard-delete the tombstones, then the content becomes orphaned.
+    expect(store.deleteInactiveDocuments()).toBeGreaterThanOrEqual(1);
+    expect(store.cleanupOrphanedContent()).toBeGreaterThanOrEqual(1);
+    const contentAfter = store.db.prepare(
+      `SELECT hash FROM content WHERE hash = ?`
+    ).get(hash) as { hash: string } | undefined;
+    expect(contentAfter).toBeFalsy();
 
     await cleanupEnv(store);
   });

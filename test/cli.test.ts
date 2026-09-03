@@ -2525,11 +2525,14 @@ describe("status and collection list hide filesystem paths", () => {
     expect(pathLines.length).toBe(0);
   }, 20000);
 
-  test("status shows daemon URL when mcp.port exists", async () => {
+  test("status treats a pidfile owned by a non-qmd process as stale (#806)", async () => {
     const cacheHome = join(testDir, `status-cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const qmdCacheDir = join(cacheHome, "qmd");
     await mkdir(qmdCacheDir, { recursive: true });
-    writeFileSync(join(qmdCacheDir, "mcp.pid"), String(process.pid));
+    // This test process is alive but is not qmd — a recycled pidfile must not
+    // be reported as a running daemon, and must be cleaned up silently.
+    const stalePidFile = join(qmdCacheDir, "mcp.pid");
+    writeFileSync(stalePidFile, String(process.pid));
     writeFileSync(join(qmdCacheDir, "mcp.port"), "43210");
 
     const { stdout, exitCode } = await runQmd(["status"], {
@@ -2538,7 +2541,8 @@ describe("status and collection list hide filesystem paths", () => {
       env: { XDG_CACHE_HOME: cacheHome },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain(`MCP:   running (PID ${process.pid}) at http://localhost:43210`);
+    expect(stdout).not.toContain("MCP:   running");
+    expect(existsSync(stalePidFile)).toBe(false);
   });
 
   test("collection list does not show full filesystem paths", async () => {
@@ -3084,6 +3088,12 @@ describe("mcp http daemon", () => {
     const portFile = join(daemonCacheDir, "qmd", "mcp.port");
     expect(existsSync(portFile)).toBe(true);
     expect(parseInt(readFileSync(portFile, "utf-8").trim())).toBe(port);
+
+    // status renders the daemon URL from that port file. Asserted against a
+    // real daemon because isQmdMcpPid (#806) only trusts a pidfile whose PID
+    // is genuinely a qmd process.
+    const status = await runDaemonQmd(["status"]);
+    expect(status.stdout).toContain(`MCP:   running (PID ${pid}) at http://localhost:${port}`);
 
     // Cleanup
     await runDaemonQmd(["mcp", "stop"]);

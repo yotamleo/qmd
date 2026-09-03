@@ -1867,7 +1867,7 @@ describe("Caching", () => {
     const modelA = "hf:example/rerank-a/a.gguf";
     const modelB = "hf:example/rerank-b/b.gguf";
     const mockA = makeMock(modelA, 0.11);
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLLM").mockReturnValue(mockA.llm as any);
 
     try {
       const first = await store.rerank(query, docs);

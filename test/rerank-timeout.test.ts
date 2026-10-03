@@ -67,6 +67,9 @@ describe("rerank timeout", () => {
     expect(resolveRerankTimeoutMs()).toBe(1500);
     process.env.QMD_RERANK_TIMEOUT_MS = "garbage";
     expect(resolveRerankTimeoutMs()).toBe(60_000);
+    // setTimeout would clamp this to 1 ms and time out every rerank instantly.
+    process.env.QMD_RERANK_TIMEOUT_MS = "9999999999";
+    expect(resolveRerankTimeoutMs()).toBe(2_147_483_647);
   });
 
   test("store.rerank rejects with RerankTimeoutError within budget and poisons the LLM", async () => {
@@ -81,6 +84,7 @@ describe("rerank timeout", () => {
 
   test("a real LlamaCpp is poisoned after a timeout and the process-wide flag is set", async () => {
     const real = new LlamaCpp({});
+    vi.spyOn(real, "prepareRerank").mockResolvedValue(undefined); // no native load
     vi.spyOn(real, "rerank").mockImplementation(() => new Promise<never>(() => {}));
     vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(real);
     expect(isLlamaPoisoned()).toBe(false);
@@ -112,7 +116,33 @@ describe("rerank timeout", () => {
   });
 });
 
+describe("rerank budget", () => {
+  test("cold model load (prepareRerank) is outside the timeout budget", async () => {
+    const llm = {
+      rerankModelName: "hf:example/rerank/slow-load.gguf",
+      poison: vi.fn(),
+      prepareRerank: vi.fn(() => new Promise<void>(r => setTimeout(r, 200))),
+      rerank: vi.fn(async (_q: string, docs: { file: string; text: string }[]) => ({
+        results: docs.map((d, index) => ({ file: d.file, score: 0.7, index })), model: "m",
+      })),
+    };
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    const out = await store.rerank("q", [{ file: "a.md", text: "alpha" }]); // budget is 50 ms
+    expect(out[0]!.score).toBe(0.7);
+    expect(llm.poison).not.toHaveBeenCalled();
+  });
+});
+
 describe("poisoned LlamaCpp", () => {
+  test("dispose leaves a poisoned instance alone (a native call is still running on it)", async () => {
+    const llm = new LlamaCpp({});
+    llm.poison("test");
+    await llm.dispose();
+    await llm.unloadIdleResources();
+    expect((llm as any).disposed).toBe(false);
+  });
+
   test("refuses every native entry point without touching native code", async () => {
     const llm = new LlamaCpp({});
     const ensure = vi.spyOn(llm as any, "ensureLlama");

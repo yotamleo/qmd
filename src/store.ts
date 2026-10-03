@@ -4644,6 +4644,8 @@ export async function rerank(query: string, documents: { file: string; text: str
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const maxChars = resolveRerankMaxDocChars();
     const sentDocs = uncachedDocs.map(d => d.text.length > maxChars ? { ...d, text: d.text.slice(0, maxChars) } : d);
+    // Cold model/context load can legitimately take a while: keep it out of the budget.
+    await llm.prepareRerank?.();
     const timeoutMs = resolveRerankTimeoutMs();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let rerankResult;

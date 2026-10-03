@@ -31,7 +31,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
-import { isLlamaPoisoned } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -41,12 +41,13 @@ import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 /**
  * A rerank that timed out leaves a native call spinning forever (it ignores
  * SIGTERM), so the process is unusable. Answer with the fallback results that
- * are already on their way, then exit so the supervisor restarts the server.
+ * are already on their way, then kill the process (exit() would block on the
+ * stuck native thread). A supervisor, if any, restarts the server.
  */
 function exitIfRerankHung(): void {
   if (!isLlamaPoisoned()) return;
-  console.error("QMD: rerank timed out; served unreranked results and exiting so the supervisor can restart the server");
-  setTimeout(() => process.exit(1), 1000);
+  console.error("QMD: rerank timed out; served unreranked results and killing the process (restart the server)");
+  setTimeout(() => killProcessNow(), 1000);
 }
 
 type SearchResultItem = {

@@ -112,6 +112,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   for (const r of results) {
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
+  if (results.some(r => r.rerankTimedOut)) {
+    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order) and the server is restarting.');
+  }
   return lines.join('\n');
 }
 

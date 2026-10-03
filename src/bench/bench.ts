@@ -25,7 +25,7 @@ import {
   type ExpandedQuery,
 } from "../index.js";
 import { scoreResults } from "./score.js";
-import { isLlamaPoisoned, RerankTimeoutError } from "../llm.js";
+import { isLlamaPoisoned } from "../llm.js";
 import type {
   BenchmarkFixture,
   BenchmarkQuery,
@@ -180,10 +180,10 @@ async function runQuery(
   const flags: { rerankTimedOut?: boolean } = {};
   try {
     resultFiles = await backend.run(store, query, limit, collection, flags);
-  } catch (err) {
+  } catch {
     // Backend may not be available (e.g., no embeddings for vector search)
     return {
-      ...(err instanceof RerankTimeoutError || isLlamaPoisoned() ? { rerank_timed_out: true as const } : {}),
+      ...(backend.name === "full" && isLlamaPoisoned() ? { rerank_timed_out: true as const } : {}),
       precision_at_k: 0,
       recall: 0,
       recall_at_1: 0,

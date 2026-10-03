@@ -4636,7 +4636,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   for (const doc of documents) {
     const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text, maxChars });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    // The legacy key predates maxChars, so it can only vouch for chunks that are sent whole.
+    const cached = getCachedResult(db, cacheKey) ?? (doc.text.length <= maxChars ? getCachedResult(db, legacyCacheKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {

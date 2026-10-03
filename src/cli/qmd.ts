@@ -4823,6 +4823,7 @@ if (isMain) {
           configPath: configExists() ? getConfigPath() : undefined,
         });
       } catch (error) {
+        await exitIfRerankHung();
         exitWithError(error);
       }
       // A timed-out rerank leaves a native call hung; the rows are already printed.

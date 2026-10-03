@@ -31,11 +31,23 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { isLlamaPoisoned } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
 // Types for structured content
 // =============================================================================
+
+/**
+ * A rerank that timed out leaves a native call spinning forever (it ignores
+ * SIGTERM), so the process is unusable. Answer with the fallback results that
+ * are already on their way, then exit so the supervisor restarts the server.
+ */
+function exitIfRerankHung(): void {
+  if (!isLlamaPoisoned()) return;
+  console.error("QMD: rerank timed out; served unreranked results and exiting so the supervisor can restart the server");
+  setTimeout(() => process.exit(1), 1000);
+}
 
 type SearchResultItem = {
   docid: string;  // Short docid (#abc123) for quick reference
@@ -411,6 +423,8 @@ Intent-aware lex (C++ performance, not sports):
         || searches?.find(s => s.type === 'vec')?.query
         || searches?.[0]?.query
         || "";
+
+      exitIfRerankHung();
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
@@ -1099,6 +1113,7 @@ export async function startMcpHttpServer(
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
+        exitIfRerankHung();
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }

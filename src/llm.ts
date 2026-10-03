@@ -312,6 +312,33 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
 }
 
+const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
+
+/** Budget for one native rerank call. Override with QMD_RERANK_TIMEOUT_MS. */
+export function resolveRerankTimeoutMs(): number {
+  const raw = Number(process.env.QMD_RERANK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RERANK_TIMEOUT_MS;
+}
+
+/** Thrown when a native rerank call does not settle within its budget. */
+export class RerankTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`Rerank did not finish within ${timeoutMs}ms`);
+    this.name = "RerankTimeoutError";
+  }
+}
+
+// Set once any LlamaCpp instance is poisoned. A hung native call (e.g. a GPU
+// fault leaving ggml-vulkan waiting on a fence forever) cannot be cancelled and
+// ignores SIGTERM, so callers use this to know they must exit the process.
+let llamaPoisoned = false;
+export function isLlamaPoisoned(): boolean {
+  return llamaPoisoned;
+}
+export function resetLlamaPoisonedForTests(): void {
+  llamaPoisoned = false;
+}
+
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
   return {
     embed: resolveEmbedModel(config),
@@ -862,6 +889,25 @@ export class LlamaCpp implements LLM {
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
+
+  // Set after a native call hung; every later native call is refused.
+  private poisonReason: string | null = null;
+
+  get poisoned(): boolean {
+    return this.poisonReason !== null;
+  }
+
+  /** Refuse all further native calls on this instance. */
+  poison(reason: string): void {
+    this.poisonReason ??= reason;
+    llamaPoisoned = true;
+  }
+
+  private assertNotPoisoned(): void {
+    if (this.poisonReason !== null) {
+      throw new Error(`LlamaCpp instance is poisoned (${this.poisonReason}); restart the process`);
+    }
+  }
 
 
   constructor(config: LlamaCppConfig = {}) {
@@ -1471,6 +1517,7 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    this.assertNotPoisoned();
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1500,6 +1547,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1567,6 +1615,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1628,6 +1677,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1735,6 +1785,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();

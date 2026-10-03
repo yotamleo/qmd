@@ -59,6 +59,7 @@ type SearchResultItem = {
   metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
   line: number;   // Absolute line in source markdown
   snippet: string;
+  rerankTimedOut?: true;  // Reranker timed out: score is RRF-only (unreranked)
 };
 
 /**
@@ -436,6 +437,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+          ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
           line,
           snippet: addLineNumbers(snippet, line),
         };
@@ -1107,6 +1109,7 @@ export async function startMcpHttpServer(
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+            ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };

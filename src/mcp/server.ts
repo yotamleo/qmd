@@ -33,6 +33,7 @@ import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 import { isLlamaPoisoned, killProcessNow } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { checkBearer } from "./auth.js";
 
 // =============================================================================
 // Types for structured content
@@ -908,7 +909,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[]; authToken?: string } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -1023,6 +1024,16 @@ export async function startMcpHttpServer(
           id: null,
         }));
         log(`${ts()} ${nodeReq.method} ${pathname} 403 — ${verdict.reason}`);
+        return;
+      }
+
+      // Bearer token (when configured): everything except the /health liveness
+      // probe. The token is never logged.
+      if (options.authToken && !(pathname === "/health" && nodeReq.method === "GET")
+          && !checkBearer(nodeReq.headers.authorization, options.authToken)) {
+        nodeRes.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" });
+        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+        log(`${ts()} ${nodeReq.method} ${pathname} 401`);
         return;
       }
 
